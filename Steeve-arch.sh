@@ -14,10 +14,8 @@ USERNAME="steeve"
 PASSWORD="changeme"
 
 echo "🔥 Nettoyage complet du disque /dev/$DISK..."
-sgdisk --zap-all /dev/$DISK
-dd if=/dev/zero of=/dev/$DISK bs=1M count=100 status=none
-dd if=/dev/zero of=/dev/$DISK bs=1M count=100 seek=$(( $(blockdev --getsz /dev/$DISK) / 2048 - 100 )) status=none
-wipefs -a /dev/$DISK
+sgdisk --zap-all /dev/nvme0n1
+wipefs -a /dev/nvme0n1
 
 echo "📦 Partitionnement automatique (EFI, boot, swap, root, home)..."
 sgdisk -n1:1MiB:513MiB       -t1:ef00 -c1:"EFI System"   /dev/$DISK
