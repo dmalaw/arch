@@ -1,101 +1,111 @@
 #!/bin/bash
 set -e
-export TERM=linux
+
+### VARIABLES
+DISK="/dev/nvme0n1"
+EFI="${DISK}p1"
+ROOT="${DISK}p2"
+USERNAME="steeve"
+HOSTNAME="archMaN"
+LOCALE="en_CA.UTF-8"
+KEYMAP="us"
+SLEEP_MINUTES="10"
+
+### TEMPORARY KEYMAP
 loadkeys us
 
-DISK="nvme0n1"
-BOOTPART="/dev/${DISK}p1"    # EFI (FAT32)
-EFIPART="/dev/${DISK}p2"     # /boot (ext4)
-SWAPPART="/dev/${DISK}p3"    # swap
-ROOTPART="/dev/${DISK}p4"    # /
-HOMEPART="/dev/${DISK}p5"    # /home
+### CONFIRMATION
+read -p "⚠️ Ce script efface entièrement $DISK (nvme0n1). Continuer ? (o/N) " confirm
+[[ $confirm != "o" ]] && echo "Installation annulée." && exit 1
 
-USERNAME="steeve"
-PASSWORD="changeme"
+### PARTITIONNEMENT
+sgdisk -Z $DISK
+sgdisk -n1:0:+512M -t1:ef00 -c1:EFI $DISK
+sgdisk -n2:0:0      -t2:8300 -c2:ROOT $DISK
 
-echo "🔥 Nettoyage rapide du disque /dev/$DISK..."
-sgdisk --zap-all /dev/$DISK
-wipefs -af /dev/$DISK
+### FORMATAGE
+mkfs.fat -F32 $EFI
+mkfs.btrfs -f $ROOT
 
-echo "📦 Partitionnement automatique (EFI, boot, swap, root, home)..."
-sgdisk -n1:0:+512MiB   -t1:ef00 -c1:"EFI System"   /dev/$DISK
-sgdisk -n2:0:+1GiB     -t2:8300 -c2:"Boot"         /dev/$DISK
-sgdisk -n3:0:+16GiB    -t3:8200 -c3:"Swap"         /dev/$DISK
-sgdisk -n4:0:+100GiB   -t4:8300 -c4:"Root"         /dev/$DISK
-sgdisk -n5:0:0         -t5:8300 -c5:"Home"         /dev/$DISK
+### CRÉATION DES SOUS-VOLUMES
+mount $ROOT /mnt
+btrfs subvolume create /mnt/@
+btrfs subvolume create /mnt/@home
+umount /mnt
 
-echo "🧹 Formatage des partitions..."
-mkfs.fat -F32 $BOOTPART
-mkfs.ext4 $EFIPART
-mkswap $SWAPPART
-swapon $SWAPPART
-mkfs.btrfs -f $ROOTPART
-mkfs.ext4 $HOMEPART
+### MONTAGE DES VOLUMES
+mount -o compress=zstd,subvol=@ $ROOT /mnt
+mkdir -p /mnt/{boot,home}
+mount -o compress=zstd,subvol=@home $ROOT /mnt/home
+mount $EFI /mnt/boot
 
-echo "📁 Montage dans le bon ordre..."
-mount $ROOTPART /mnt
-mkdir -p /mnt/boot /mnt/boot/efi /mnt/home
-mount $EFIPART /mnt/boot        # /boot = ext4
-mount $BOOTPART /mnt/boot/efi   # /boot/efi = FAT32
-mount $HOMEPART /mnt/home
+### INSTALLATION DE BASE
+pacstrap -K /mnt base linux linux-firmware amd-ucode btrfs-progs \
+  networkmanager vim nano sudo git neofetch \
+  mesa vulkan-radeon lib32-mesa lib32-vulkan-radeon xf86-video-amdgpu \
+  systemd-boot
 
-echo "📦 Installation du système de base..."
-pacstrap -K /mnt base linux linux-firmware sudo btrfs-progs nano git grub efibootmgr networkmanager timeshift
-
+### FSTAB
 genfstab -U /mnt >> /mnt/etc/fstab
 
-echo "⚙️ Configuration système dans chroot..."
-arch-chroot /mnt /bin/bash <<'EOF'
-
-# Configuration locale
+### CHROOT CONFIGURATION
+arch-chroot /mnt /bin/bash <<EOF
 ln -sf /usr/share/zoneinfo/America/Toronto /etc/localtime
 hwclock --systohc
 
-echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+echo "$LOCALE UTF-8" >> /etc/locale.gen
 locale-gen
-echo "LANG=en_US.UTF-8" > /etc/locale.conf
-echo "KEYMAP=us" > /etc/vconsole.conf
+echo "LANG=$LOCALE" > /etc/locale.conf
+echo "KEYMAP=$KEYMAP" > /etc/vconsole.conf
 
-# Hostname
-echo "archMaN" > /etc/hostname
-cat <<HOSTS > /etc/hosts
-127.0.0.1   localhost
-::1         localhost
-127.0.1.1   archMaN.localdomain archMaN
-HOSTS
+echo "$HOSTNAME" > /etc/hostname
+cat > /etc/hosts <<EOL
+127.0.0.1 localhost
+::1       localhost
+127.0.1.1 $HOSTNAME.localdomain $HOSTNAME
+EOL
 
-# Utilisateur + root
-echo "root:changeme" | chpasswd
-useradd -mG wheel -s /bin/bash steeve
-echo "steeve:changeme" | chpasswd
-echo "steeve ALL=(ALL) ALL" > /etc/sudoers.d/steeve
-chmod 440 /etc/sudoers.d/steeve
+### UTILISATEUR
+useradd -m -G wheel -s /bin/bash $USERNAME
+echo "$USERNAME:arch" | chpasswd
+echo "root:arch" | chpasswd
+sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' /etc/sudoers
 
-# GRUB + hibernation
-UUID_SWAP=$(blkid -s UUID -o value /dev/nvme0n1p3)
-sed -i "s|GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"quiet resume=UUID=$UUID_SWAP\"|" /etc/default/grub
+### SYSTEMD-BOOT
+bootctl install
+UUID=\$(blkid -s UUID -o value $ROOT)
 
-# Vérifie que /boot/efi est bien monté
-if ! findmnt -rno SOURCE,TARGET /boot/efi >/dev/null; then
-  echo "❌ /boot/efi n'est pas monté ! GRUB ne peut pas s'installer."
-  exit 1
-fi
+cat > /boot/loader/loader.conf <<EOL
+default arch
+timeout 3
+editor no
+EOL
 
-# Installation GRUB
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB
-grub-mkconfig -o /boot/grub/grub.cfg
+cat > /boot/loader/entries/arch.conf <<EOL
+title   Arch Linux
+linux   /vmlinuz-linux
+initrd  /amd-ucode.img
+initrd  /initramfs-linux.img
+options root=UUID=\$UUID rw rootflags=subvol=@ quiet splash
+EOL
 
-# Réseau
+### ACTIVER SERVICES
 systemctl enable NetworkManager
+systemctl enable systemd-logind.service
+
+### CONFIG SLEEP AUTO
+mkdir -p /etc/systemd/logind.conf.d
+cat > /etc/systemd/logind.conf.d/sleep.conf <<EOL
+[Login]
+IdleAction=suspend
+IdleActionSec=${SLEEP_MINUTES}min
+EOL
 
 EOF
 
-echo "📸 Snapshot Timeshift post-install..."
-mount $ROOTPART /mnt
-arch-chroot /mnt timeshift --create --comments "Post-install Arch" --tags D
-umount -R /mnt
-swapoff $SWAPPART
-
-echo "✅ Installation Arch terminée avec succès."
-echo "➡️ Utilisateur : steeve / changeme"
-echo "💡 Tape : reboot"
+### FIN
+echo -e "\n✅ Installation complète sur $DISK (nvme0n1)"
+echo "➡️ Pour finaliser :"
+echo "arch-chroot /mnt    # Si tu veux personnaliser"
+echo "Puis :"
+echo "exit && umount -R /mnt && reboot"
